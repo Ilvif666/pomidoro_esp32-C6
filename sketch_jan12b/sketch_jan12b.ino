@@ -538,26 +538,8 @@ void drawTimer() {
     drawCenteredText(statusTxt, gfx->width() / 2, gfx->height() - 30, statusColor, 2);
     lastDisplayedState = currentState;  // Initialize state tracking
   } else {
-    // Update progress circle (only the progress part, not the border)
-    // For simplicity, redraw the whole circle but only when progress changes significantly
-    static float lastProgress = -1.0f;
-    if (abs(progress - lastProgress) > 0.01f) {  // Update if progress changed by >1%
-      // Erase old progress by redrawing border
-      for (int i = 0; i < 5; i++) {
-        gfx->drawCircle(centerX, centerY, radius - i, COLOR_GOLD);
-      }
-      // Draw new progress
-      if (progress > 0 && progress <= 1.0f) {
-        const int segments = 64;
-        for (int i = 0; i < segments * progress; i++) {
-          float angle = (i * 2.0f * PI) / segments - PI / 2.0f;
-          int x = centerX + radius * cosf(angle);
-          int y = centerY + radius * sinf(angle);
-          gfx->drawPixel(x, y, COLOR_GOLD);
-        }
-      }
-      lastProgress = progress;
-    }
+    // Update progress circle - update more frequently for smoother animation
+    drawProgressCircle(progress, centerX, centerY, radius);
   }
   
   // Update time text only if it changed (optimize to avoid flickering)
@@ -606,20 +588,54 @@ void drawTimer() {
 }
 
 void drawProgressCircle(float progress, int centerX, int centerY, int radius) {
-  // Draw circle border (thicker)
-  for (int i = 0; i < 5; i++) {
-    gfx->drawCircle(centerX, centerY, radius - i, COLOR_GOLD);
-  }
-
-  if (progress > 0 && progress <= 1.0f) {
-    const int segments = 64;  // More segments for smoother circle
-    for (int i = 0; i < segments * progress; i++) {
-      float angle = (i * 2.0f * PI) / segments - PI / 2.0f;
-      int x = centerX + radius * cosf(angle);
-      int y = centerY + radius * sinf(angle);
-      gfx->drawPixel(x, y, COLOR_GOLD);
+  static float lastProgress = -1.0f;
+  static bool circleDrawn = false;
+  int borderWidth = 5;
+  
+  // Only redraw full circle on first call or if progress reset (timer restarted)
+  if (!circleDrawn || progress < lastProgress || lastProgress < 0) {
+    // Draw the full circle border (same as splash screen)
+    for (int16_t i = 0; i < borderWidth; i++) {
+      gfx->drawCircle(centerX, centerY, radius - i, COLOR_GOLD);
+    }
+    circleDrawn = true;
+    if (progress < lastProgress || lastProgress < 0) {
+      lastProgress = 0.0f;  // Reset on timer restart
     }
   }
+  
+  // Only erase the newly elapsed portion (smooth incremental update)
+  if (progress > lastProgress && lastProgress >= 0) {
+    // Calculate how many new segments to erase
+    const int segments = 720;  // More segments for smoother progress (2 per degree)
+    int lastSegmentsErased = (int)(segments * lastProgress);
+    int currentSegmentsErased = (int)(segments * progress);
+    
+    // Erase only the newly elapsed portion to avoid flickering
+    for (int i = lastSegmentsErased; i < currentSegmentsErased; i++) {
+      float angle = (i * 2.0f * PI) / segments - PI / 2.0f;  // Start from top
+      // Erase all border layers
+      for (int thickness = 0; thickness < borderWidth; thickness++) {
+        int currentRadius = radius - thickness;
+        if (currentRadius < 0) continue;
+        
+        // Erase a small arc segment to catch all circle pixels
+        for (float angleOffset = -0.015f; angleOffset <= 0.015f; angleOffset += 0.005f) {
+          float currentAngle = angle + angleOffset;
+          int x = centerX + currentRadius * cosf(currentAngle);
+          int y = centerY + currentRadius * sinf(currentAngle);
+          gfx->drawPixel(x, y, COLOR_BLACK);
+          // Erase neighboring pixels to ensure complete erasure
+          gfx->drawPixel(x + 1, y, COLOR_BLACK);
+          gfx->drawPixel(x - 1, y, COLOR_BLACK);
+          gfx->drawPixel(x, y + 1, COLOR_BLACK);
+          gfx->drawPixel(x, y - 1, COLOR_BLACK);
+        }
+      }
+    }
+  }
+  
+  lastProgress = progress;
 }
 
 void displayStoppedState() {
