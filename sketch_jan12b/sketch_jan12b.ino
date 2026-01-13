@@ -483,14 +483,14 @@ void updateDisplay() {
   if (currentState == STOPPED) {
     return;
   } else {
-    // Only redraw if time changed (prevent flickering)
-    static unsigned long lastDisplayedSeconds = 999;
-    unsigned long elapsed = (currentState == RUNNING) ? (millis() - startTime) : elapsedBeforePause;
-    unsigned long currentSeconds = (elapsed / 1000UL) % 60UL;
+    // Update display exactly once per second for smooth timer
+    static unsigned long lastDisplayUpdate = 0;
+    unsigned long now = millis();
     
-    if (currentSeconds != lastDisplayedSeconds || lastDisplayedSeconds == 999) {
+    // Update every 1000ms (1 second) exactly
+    if (now - lastDisplayUpdate >= 1000) {
       drawTimer();
-      lastDisplayedSeconds = currentSeconds;
+      lastDisplayUpdate = now;  // Use current time, not lastDisplayUpdate + 1000, to prevent drift
     }
   }
 }
