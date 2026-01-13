@@ -160,6 +160,9 @@ static bool lastIntState = HIGH;
 // Debounce variables for TP_INT
 static unsigned long lastTpIntLowTime = 0;
 static const unsigned long TP_INT_DEBOUNCE_MS = 200;  // Ignore brief HIGH pulses
+// Protection against short tap after timer start
+unsigned long timerStartTime = 0;
+const unsigned long SHORT_TAP_BLOCK_MS = 1500;  // Block short taps for 1.5s after timer start
 
 // --- Helper: draw golden "R" splash (used as stopped screen) ---
 void drawSplash() {
@@ -168,7 +171,7 @@ void drawSplash() {
   uint16_t golden = COLOR_GOLD;
   int16_t centerX = gfx->width() / 2;
   int16_t centerY = gfx->height() / 2;
-  int16_t radius = 60;
+  int16_t radius = 70;
   int16_t borderWidth = 5;
 
   for (int16_t i = 0; i < borderWidth; i++) {
@@ -205,12 +208,13 @@ void triggerFlash(uint16_t color) {
 
 void displayStoppedState(); // forward
 void drawTimer();           // forward
-void drawProgressCircle(float progress);
+void drawProgressCircle(float progress, int centerX, int centerY, int radius);
 
 void startTimer() {
   currentState = RUNNING;
   isWorkSession = true;
   startTime = millis();
+  timerStartTime = millis();  // Track when timer started for short tap protection
   elapsedBeforePause = 0;
   triggerFlash(COLOR_GOLD);
 }
@@ -394,7 +398,12 @@ void handleTouchInput() {
     Serial.println(" ms <<<");
 
     // Only process short tap if long press wasn't already handled
-    if (!longPressDetected && touchDuration > 50) {
+    // Reduced threshold from 50ms to 10ms for faster response
+    // Also block short taps for a short period after timer start to prevent accidental pause
+    unsigned long timeSinceStart = (timerStartTime > 0) ? (millis() - timerStartTime) : SHORT_TAP_BLOCK_MS + 1;
+    bool blockShortTap = (timeSinceStart < SHORT_TAP_BLOCK_MS);
+    
+    if (!longPressDetected && touchDuration > 10 && !blockShortTap) {
       Serial.println("*** SHORT TAP detected! ***");
       if (currentState == RUNNING) {
         pauseTimer();
@@ -403,14 +412,17 @@ void handleTouchInput() {
       }
     } else if (longPressDetected) {
       Serial.println("*** LONG PRESS was already handled ***");
+    } else if (blockShortTap) {
+      Serial.println("*** SHORT TAP blocked (too soon after timer start) ***");
     }
     touchPressed = false;
     longPressDetected = false;
 
-  } else if (touchPressed && !longPressDetected) {
-    // Check for long press while still touching
+  } else if (touchPressed) {
     unsigned long elapsed = millis() - touchStartTime;
-    if (elapsed > LONG_PRESS_MS) {
+    
+    // Check for long press (works every time, not just first)
+    if (elapsed > LONG_PRESS_MS && !longPressDetected) {
       longPressDetected = true;
       Serial.print("*** LONG PRESS detected! (");
       Serial.print(elapsed);
@@ -423,8 +435,10 @@ void handleTouchInput() {
         Serial.println("-> Stopping timer");
         stopTimer();
       }
-      // Keep touchPressed and longPressDetected set to prevent short tap on release
-    } else {
+      // Reset start time to allow detecting next long press while still holding
+      touchStartTime = millis();
+      longPressDetected = false;  // Reset to allow next long press detection
+    } else if (!longPressDetected) {
       // Debug: show progress towards long press
       static unsigned long lastProgress = 0;
       if (millis() - lastProgress > 200) {
@@ -464,7 +478,15 @@ void updateDisplay() {
   if (currentState == STOPPED) {
     return;
   } else {
-    drawTimer();
+    // Only redraw if time changed (prevent flickering)
+    static unsigned long lastDisplayedSeconds = 999;
+    unsigned long elapsed = (currentState == RUNNING) ? (millis() - startTime) : elapsedBeforePause;
+    unsigned long currentSeconds = (elapsed / 1000UL) % 60UL;
+    
+    if (currentSeconds != lastDisplayedSeconds || lastDisplayedSeconds == 999) {
+      drawTimer();
+      lastDisplayedSeconds = currentSeconds;
+    }
   }
 }
 
@@ -485,12 +507,19 @@ void drawTimer() {
   char timeStr[6];
   sprintf(timeStr, "%02lu:%02lu", minutes, seconds);
 
-  drawCenteredText(timeStr, gfx->width() / 2, gfx->height() / 2 - 20, COLOR_GOLD, 3);
-
   float progress = (float)elapsed / (float)POMODORO_DURATION;
   if (progress < 0) progress = 0;
   if (progress > 1) progress = 1;
-  drawProgressCircle(progress);
+  
+  // Draw circle first, then time inside it
+  int centerX = gfx->width() / 2;
+  int centerY = gfx->height() / 2;
+  int radius = 70;  // Bigger circle
+  
+  drawProgressCircle(progress, centerX, centerY, radius);
+  
+  // Draw time inside the circle (moved up a bit)
+  drawCenteredText(timeStr, centerX, centerY - 20, COLOR_GOLD, 3);
 
   const char *statusTxt = nullptr;
   uint16_t statusColor = COLOR_GOLD;
@@ -502,18 +531,17 @@ void drawTimer() {
     statusTxt = "REST";
     statusColor = COLOR_BLUE;
   }
-  drawCenteredText(statusTxt, gfx->width() / 2, gfx->height() - 30, statusColor, 1);
+  drawCenteredText(statusTxt, gfx->width() / 2, gfx->height() - 30, statusColor, 2);  // Bigger text (size 2)
 }
 
-void drawProgressCircle(float progress) {
-  int centerX = gfx->width() / 2;
-  int centerY = gfx->height() / 2 + 40;
-  int radius = 30;
-
-  gfx->drawCircle(centerX, centerY, radius, COLOR_GOLD);
+void drawProgressCircle(float progress, int centerX, int centerY, int radius) {
+  // Draw circle border (thicker)
+  for (int i = 0; i < 5; i++) {
+    gfx->drawCircle(centerX, centerY, radius - i, COLOR_GOLD);
+  }
 
   if (progress > 0 && progress <= 1.0f) {
-    const int segments = 32;
+    const int segments = 64;  // More segments for smoother circle
     for (int i = 0; i < segments * progress; i++) {
       float angle = (i * 2.0f * PI) / segments - PI / 2.0f;
       int x = centerX + radius * cosf(angle);
