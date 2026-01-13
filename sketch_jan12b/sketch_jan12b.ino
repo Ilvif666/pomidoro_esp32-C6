@@ -221,7 +221,7 @@ void startTimer() {
   timerStartTime = millis();  // Track when timer started for short tap protection
   elapsedBeforePause = 0;
   displayInitialized = false;  // Force full redraw on timer start
-  triggerFlash(COLOR_GOLD);
+  // Removed flash effect - no yellow screen on start
 }
 
 void pauseTimer() {
