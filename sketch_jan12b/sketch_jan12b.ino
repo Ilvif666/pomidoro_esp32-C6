@@ -4,6 +4,7 @@
 
 #include <Arduino_GFX_Library.h>
 #include <Wire.h>
+#include <math.h>
 #include "FreeSansBold24pt7b.h"  // Smooth font for the logo and titles
 #include "esp_lcd_touch_axs5106l.h"
 
@@ -124,6 +125,7 @@ void lcd_reg_init(void) {
 const uint16_t COLOR_BLACK = 0x0000;
 const uint16_t COLOR_GOLD  = 0xFCE0; // tuned golden
 const uint16_t COLOR_BLUE  = 0x001F;
+const uint16_t COLOR_GREEN = 0x07E0;
 
 // --- Pomodoro logic ---
 enum TimerState {
@@ -168,6 +170,28 @@ static bool displayInitialized = false;
 static char lastTimeStr[6] = "";
 static TimerState lastDisplayedState = STOPPED;  // Track state changes for status update
 
+// Status button bounds (for pause/start button at bottom)
+static int16_t statusBtnLeft = 0;
+static int16_t statusBtnRight = 0;
+static int16_t statusBtnTop = 0;
+static int16_t statusBtnBottom = 0;
+static bool statusBtnValid = false;
+
+// Last known touch position (for button hit-test & indicator)
+static int16_t lastTouchX = 0;
+static int16_t lastTouchY = 0;
+static bool lastTouchValid = false;
+
+// Tap indicator (small green circle) to show taps
+static bool tapIndicatorActive = false;
+static unsigned long tapIndicatorStart = 0;
+static int16_t tapIndicatorX = 0;
+static int16_t tapIndicatorY = 0;
+const unsigned long TAP_INDICATOR_DURATION = 500;  // ms
+
+// Tap indicator radius (used for drawing / visual size)
+static const int TAP_RADIUS = 8;
+
 // --- Helper: draw golden "R" splash (used as stopped screen) ---
 void drawSplash() {
   gfx->fillScreen(COLOR_BLACK);
@@ -197,7 +221,9 @@ void drawCenteredText(const char *txt, int16_t cx, int16_t cy, uint16_t color, u
   gfx->setTextSize(size, size, 0);
   gfx->getTextBounds(txt, 0, 0, &x1, &y1, &w, &h);
   int16_t x = cx - (int16_t)w / 2;
-  int16_t y = cy + (int16_t)h / 2;
+  // Center text vertically: cy is the desired center, y1 is offset from baseline (usually negative)
+  // cursorY + y1 + h/2 = cy, so cursorY = cy - y1 - h/2
+  int16_t y = cy - y1 - (int16_t)h / 2;
   gfx->setCursor(x, y);
   gfx->setTextColor(color);
   gfx->print(txt);
@@ -392,11 +418,19 @@ void handleTouchInput() {
   // Read touch data for coordinates (but don't use it for state detection)
   readTouchData();
 
+  // Capture last valid touch position whenever a touch is active
+  if (touch_points.touch_num > 0) {
+    lastTouchX = touch_points.coords[0].x;
+    lastTouchY = touch_points.coords[0].y;
+    lastTouchValid = true;
+  }
+
   if (currentlyTouched && !touchPressed) {
     Serial.println(">>> TOUCH PRESSED <<<");
     touchPressed = true;
     touchStartTime = millis();
     longPressDetected = false;
+    // (optional) could capture initial touch position here if needed later
   } else if (!currentlyTouched && touchPressed) {
     unsigned long touchDuration = millis() - touchStartTime;
     Serial.print(">>> TOUCH RELEASED after ");
@@ -410,11 +444,44 @@ void handleTouchInput() {
     bool blockShortTap = (timeSinceStart < SHORT_TAP_BLOCK_MS);
     
     if (!longPressDetected && touchDuration > 10 && !blockShortTap) {
-      Serial.println("*** SHORT TAP detected! ***");
-      if (currentState == RUNNING) {
-        pauseTimer();
-      } else if (currentState == PAUSED) {
-        resumeTimer();
+      // Base position for this tap (use last valid touch, as TP_INT may already be HIGH)
+      int16_t tx = lastTouchValid ? lastTouchX : -1;
+      int16_t ty = lastTouchValid ? lastTouchY : -1;
+
+      // Always draw tap indicator if we have a valid position
+      if (lastTouchValid && tx >= 0 && ty >= 0) {
+        tapIndicatorX = tx;
+        tapIndicatorY = ty;
+        tapIndicatorActive = true;
+        tapIndicatorStart = millis();
+      }
+
+      // Use last known touch coordinates to detect click on status button
+      bool inStatusButton = false;
+      if (statusBtnValid && lastTouchValid && tx >= 0 && ty >= 0) {
+        if (tx >= statusBtnLeft && tx <= statusBtnRight &&
+            ty >= statusBtnTop  && ty <= statusBtnBottom) {
+          inStatusButton = true;
+        }
+      }
+
+      if (inStatusButton && (currentState == RUNNING || currentState == PAUSED)) {
+        Serial.println("*** STATUS BUTTON CLICKED ***");
+        // Save old state before changing
+        TimerState oldState = currentState;
+        if (currentState == RUNNING) {
+          pauseTimer();
+        } else { // PAUSED
+          resumeTimer();
+        }
+        // Force immediate button update by setting lastDisplayedState to old state
+        // This ensures updateDisplay() will detect the change and redraw the button
+        lastDisplayedState = oldState;
+        // Force immediate display update
+        updateDisplay();
+      } else {
+        // Tap outside button area — только индикатор
+        Serial.println("*** SHORT TAP ignored (outside button) ***");
       }
     } else if (longPressDetected) {
       Serial.println("*** LONG PRESS was already handled ***");
@@ -527,15 +594,43 @@ void drawTimer() {
     
     const char *statusTxt = nullptr;
     uint16_t statusColor = COLOR_GOLD;
+    // Status button text: when running -> "pause", when paused -> "start"
     if (currentState == PAUSED) {
-      statusTxt = "PAUSED";
+      statusTxt = "start";
+    } else if (currentState == RUNNING) {
+      statusTxt = "pause";
     } else if (isWorkSession) {
-      statusTxt = "WORK";
+      statusTxt = "work";
     } else {
-      statusTxt = "REST";
+      statusTxt = "rest";
       statusColor = COLOR_BLUE;
     }
-    drawCenteredText(statusTxt, gfx->width() / 2, gfx->height() - 30, statusColor, 2);
+    int16_t statusCenterX = gfx->width() / 2;
+    int16_t statusY = gfx->height() - 30;
+
+    // First compute text bounds to define the button rectangle
+    int16_t x1, y1;
+    uint16_t w, h;
+    gfx->setFont(nullptr);
+    gfx->setTextSize(3, 3, 0);
+    gfx->getTextBounds(statusTxt, 0, 0, &x1, &y1, &w, &h);
+
+    int padding = 6;
+    statusBtnLeft   = statusCenterX - (int16_t)w / 2 - padding;
+    statusBtnRight  = statusCenterX + (int16_t)w / 2 + padding;
+    statusBtnTop    = statusY - (int16_t)h - padding;
+    statusBtnBottom = statusY + padding;
+
+    // Draw 1-pixel border around button
+    gfx->drawRect(statusBtnLeft, statusBtnTop,
+                  statusBtnRight - statusBtnLeft,
+                  statusBtnBottom - statusBtnTop,
+                  statusColor);
+
+    // Now draw the status text centered inside the button rectangle
+    int16_t btnCenterY = (statusBtnTop + statusBtnBottom) / 2;
+    drawCenteredText(statusTxt, statusCenterX, btnCenterY, statusColor, 3);
+    statusBtnValid = true;
     lastDisplayedState = currentState;  // Initialize state tracking
   } else {
     // Update progress circle - update more frequently for smoother animation
@@ -547,11 +642,11 @@ void drawTimer() {
     // Erase old text by drawing it in black color (more efficient than fillRect)
     if (lastTimeStr[0] != '\0') {
       // Draw old text in black to erase it
-      drawCenteredText(lastTimeStr, centerX, centerY - 20, COLOR_BLACK, 3);
+      drawCenteredText(lastTimeStr, centerX, centerY, COLOR_BLACK, 3);
     }
     
     // Draw new time in gold
-    drawCenteredText(timeStr, centerX, centerY - 20, COLOR_GOLD, 3);
+    drawCenteredText(timeStr, centerX, centerY, COLOR_GOLD, 3);
     strcpy(lastTimeStr, timeStr);
   }
   
@@ -561,11 +656,13 @@ void drawTimer() {
     const char *statusTxt = nullptr;
     uint16_t statusColor = COLOR_GOLD;
     if (currentState == PAUSED) {
-      statusTxt = "PAUSED";
+      statusTxt = "start";
+    } else if (currentState == RUNNING) {
+      statusTxt = "pause";
     } else if (isWorkSession) {
-      statusTxt = "WORK";
+      statusTxt = "work";
     } else {
-      statusTxt = "REST";
+      statusTxt = "rest";
       statusColor = COLOR_BLUE;
     }
     
@@ -573,16 +670,49 @@ void drawTimer() {
     if (lastDisplayedState != STOPPED) {
       const char *oldStatusTxt = nullptr;
       if (lastDisplayedState == PAUSED) {
-        oldStatusTxt = "PAUSED";
+        oldStatusTxt = "start";
+      } else if (lastDisplayedState == RUNNING) {
+        oldStatusTxt = "pause";
+      } else if (isWorkSession) {
+        oldStatusTxt = "work";
       } else {
-        // Use "WORK" as default for erasing (both WORK and REST are similar length)
-        oldStatusTxt = "WORK";
+        oldStatusTxt = "rest";
       }
-      drawCenteredText(oldStatusTxt, gfx->width() / 2, gfx->height() - 30, COLOR_BLACK, 2);
+      drawCenteredText(oldStatusTxt, gfx->width() / 2, gfx->height() - 30, COLOR_BLACK, 3);
     }
     
-    // Draw new status
-    drawCenteredText(statusTxt, gfx->width() / 2, gfx->height() - 30, statusColor, 2);
+    // Draw new status and update button bounds
+    int16_t statusCenterX = gfx->width() / 2;
+    int16_t statusY = gfx->height() - 30;
+
+    int16_t x1, y1;
+    uint16_t w, h;
+    gfx->setFont(nullptr);
+    gfx->setTextSize(3, 3, 0);
+    gfx->getTextBounds(statusTxt, 0, 0, &x1, &y1, &w, &h);
+
+    int padding = 6;
+    statusBtnLeft   = statusCenterX - (int16_t)w / 2 - padding;
+    statusBtnRight  = statusCenterX + (int16_t)w / 2 + padding;
+    statusBtnTop    = statusY - (int16_t)h - padding;
+    statusBtnBottom = statusY + padding;
+
+    // Erase old button area completely
+    gfx->fillRect(statusBtnLeft, statusBtnTop,
+                  statusBtnRight - statusBtnLeft,
+                  statusBtnBottom - statusBtnTop,
+                  COLOR_BLACK);
+
+    // Draw new border
+    gfx->drawRect(statusBtnLeft, statusBtnTop,
+                  statusBtnRight - statusBtnLeft,
+                  statusBtnBottom - statusBtnTop,
+                  statusColor);
+
+    // Draw text centered inside the button (по вертикали середина кнопки)
+    int16_t btnCenterY = (statusBtnTop + statusBtnBottom) / 2;
+    drawCenteredText(statusTxt, statusCenterX, btnCenterY, statusColor, 3);
+    statusBtnValid = true;
     lastDisplayedState = currentState;
   }
 }
@@ -680,5 +810,54 @@ void loop() {
   handleTouchInput();
   updateTimer();
   updateDisplay();
+
+  // Tap indicator (green circle) - draw on top, fade out, then stop drawing
+  // The next updateDisplay() will naturally restore the UI underneath
+  if (tapIndicatorActive) {
+    unsigned long dt = millis() - tapIndicatorStart;
+    if (dt >= TAP_INDICATOR_DURATION) {
+      // Expired - just stop drawing it, updateDisplay() will restore the UI naturally
+      tapIndicatorActive = false;
+    } else {
+      // Draw green circle on top, fading out as time approaches TAP_INDICATOR_DURATION
+      int16_t cx = tapIndicatorX;
+      int16_t cy = tapIndicatorY;
+      int16_t r = TAP_RADIUS;
+      
+      // Calculate fade-out alpha: 255 (full) at start, 0 (transparent) at end
+      uint8_t alpha = 255 - (uint8_t)((dt * 255) / TAP_INDICATOR_DURATION);
+      
+      // Draw circle with fade-out (blend green with black)
+      for (int16_t y = -r; y <= r; y++) {
+        for (int16_t x = -r; x <= r; x++) {
+          if (x * x + y * y <= r * r) {
+            int16_t px = cx + x;
+            int16_t py = cy + y;
+            if (px < 0 || py < 0 || px >= gfx->width() || py >= gfx->height()) continue;
+            
+            // Blend green with black based on alpha for fade-out effect
+            uint16_t fg = COLOR_GREEN;
+            uint8_t fg_r = (fg >> 11) & 0x1F;
+            uint8_t fg_g = (fg >> 5) & 0x3F;
+            uint8_t fg_b = fg & 0x1F;
+            
+            // Black (will be replaced by UI on next updateDisplay)
+            uint8_t bg_r = 0;
+            uint8_t bg_g = 0;
+            uint8_t bg_b = 0;
+            
+            // Alpha blend: out = fg * alpha + bg * (1 - alpha)
+            uint8_t out_r = (uint8_t)((fg_r * alpha + bg_r * (255 - alpha)) / 255);
+            uint8_t out_g = (uint8_t)((fg_g * alpha + bg_g * (255 - alpha)) / 255);
+            uint8_t out_b = (uint8_t)((fg_b * alpha + bg_b * (255 - alpha)) / 255);
+            
+            uint16_t out = (out_r << 11) | (out_g << 5) | out_b;
+            gfx->drawPixel(px, py, out);
+          }
+        }
+      }
+    }
+  }
+
   delay(5);
 }
