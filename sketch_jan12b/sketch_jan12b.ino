@@ -134,7 +134,18 @@ enum TimerState {
   PAUSED
 };
 
-const unsigned long POMODORO_DURATION = 25UL * 60UL * 1000UL; // 25 minutes
+enum PomodoroMode {
+  MODE_1_1,    // 1 minute work, 1 minute rest (for testing)
+  MODE_25_5,   // 25 minutes work, 5 minutes rest (standard)
+  MODE_50_10   // 50 minutes work, 10 minutes rest (extended)
+};
+
+const unsigned long POMODORO_DURATION_1 = 1UL * 60UL * 1000UL;   // 1 minute
+const unsigned long POMODORO_DURATION_25 = 25UL * 60UL * 1000UL;  // 25 minutes
+const unsigned long POMODORO_DURATION_50 = 50UL * 60UL * 1000UL; // 50 minutes
+const unsigned long REST_DURATION_1 = 1UL * 60UL * 1000UL;        // 1 minute
+const unsigned long REST_DURATION_5 = 5UL * 60UL * 1000UL;        // 5 minutes
+const unsigned long REST_DURATION_10 = 10UL * 60UL * 1000UL;      // 10 minutes
 const unsigned long FLASH_DURATION    = 500;                  // ms
 const unsigned long LONG_PRESS_MS     = 1000;                 // long press
 
@@ -145,6 +156,7 @@ static const int TP_RST = 20;
 static const int TP_INT = 21;
 
 TimerState currentState = STOPPED;
+PomodoroMode currentMode = MODE_25_5;  // Default to standard 25/5 mode
 unsigned long startTime = 0;
 unsigned long pausedTime = 0;
 unsigned long elapsedBeforePause = 0;
@@ -176,6 +188,14 @@ static int16_t statusBtnRight = 0;
 static int16_t statusBtnTop = 0;
 static int16_t statusBtnBottom = 0;
 static bool statusBtnValid = false;
+
+// Mode button bounds (for mode switch button at top)
+static int16_t modeBtnLeft = 0;
+static int16_t modeBtnRight = 0;
+static int16_t modeBtnTop = 0;
+static int16_t modeBtnBottom = 0;
+static bool modeBtnValid = false;
+static PomodoroMode lastDisplayedMode = MODE_25_5;  // Track mode changes
 
 // Last known touch position (for button hit-test & indicator)
 static int16_t lastTouchX = 0;
@@ -271,10 +291,30 @@ void stopTimer() {
   displayStoppedState();
 }
 
+// Helper function to get current duration based on mode
+unsigned long getCurrentDuration() {
+  if (isWorkSession) {
+    switch (currentMode) {
+      case MODE_1_1:  return POMODORO_DURATION_1;
+      case MODE_25_5: return POMODORO_DURATION_25;
+      case MODE_50_10: return POMODORO_DURATION_50;
+      default: return POMODORO_DURATION_25;
+    }
+  } else {
+    switch (currentMode) {
+      case MODE_1_1:  return REST_DURATION_1;
+      case MODE_25_5: return REST_DURATION_5;
+      case MODE_50_10: return REST_DURATION_10;
+      default: return REST_DURATION_5;
+    }
+  }
+}
+
 void updateTimer() {
   if (currentState == RUNNING) {
     unsigned long elapsed = millis() - startTime;
-    if (elapsed >= POMODORO_DURATION) {
+    unsigned long duration = getCurrentDuration();
+    if (elapsed >= duration) {
       if (isWorkSession) {
         isWorkSession = false;
         triggerFlash(COLOR_BLUE);
@@ -456,7 +496,16 @@ void handleTouchInput() {
         tapIndicatorStart = millis();
       }
 
-      // Use last known touch coordinates to detect click on status button
+      // Check for mode button click first
+      bool inModeButton = false;
+      if (modeBtnValid && lastTouchValid && tx >= 0 && ty >= 0) {
+        if (tx >= modeBtnLeft && tx <= modeBtnRight &&
+            ty >= modeBtnTop  && ty <= modeBtnBottom) {
+          inModeButton = true;
+        }
+      }
+      
+      // Check for status button click
       bool inStatusButton = false;
       if (statusBtnValid && lastTouchValid && tx >= 0 && ty >= 0) {
         if (tx >= statusBtnLeft && tx <= statusBtnRight &&
@@ -465,7 +514,28 @@ void handleTouchInput() {
         }
       }
 
-      if (inStatusButton && (currentState == RUNNING || currentState == PAUSED)) {
+      if (inModeButton) {
+        // Cycle through modes: 1/1 -> 25/5 -> 50/10 -> 1/1
+        Serial.println("*** MODE BUTTON CLICKED ***");
+        PomodoroMode oldMode = currentMode;
+        switch (currentMode) {
+          case MODE_1_1:
+            currentMode = MODE_25_5;
+            Serial.println("-> Switched to 25/5 mode");
+            break;
+          case MODE_25_5:
+            currentMode = MODE_50_10;
+            Serial.println("-> Switched to 50/10 mode");
+            break;
+          case MODE_50_10:
+            currentMode = MODE_1_1;
+            Serial.println("-> Switched to 1/1 mode");
+            break;
+        }
+        // Force immediate mode button update
+        lastDisplayedMode = oldMode;
+        updateDisplay();
+      } else if (inStatusButton && (currentState == RUNNING || currentState == PAUSED)) {
         Serial.println("*** STATUS BUTTON CLICKED ***");
         // Save old state before changing
         TimerState oldState = currentState;
@@ -571,14 +641,15 @@ void drawTimer() {
     elapsed = elapsedBeforePause;
   }
 
-  unsigned long remaining = (elapsed >= POMODORO_DURATION) ? 0 : (POMODORO_DURATION - elapsed);
+  unsigned long duration = getCurrentDuration();
+  unsigned long remaining = (elapsed >= duration) ? 0 : (duration - elapsed);
   unsigned long minutes = remaining / 60000UL;
   unsigned long seconds = (remaining % 60000UL) / 1000UL;
 
   char timeStr[6];
   sprintf(timeStr, "%02lu:%02lu", minutes, seconds);
 
-  float progress = (float)elapsed / (float)POMODORO_DURATION;
+  float progress = (float)elapsed / (float)duration;
   if (progress < 0) progress = 0;
   if (progress > 1) progress = 1;
   
@@ -632,6 +703,39 @@ void drawTimer() {
     drawCenteredText(statusTxt, statusCenterX, btnCenterY, statusColor, 3);
     statusBtnValid = true;
     lastDisplayedState = currentState;  // Initialize state tracking
+    
+    // Draw mode button at the top
+    const char *modeTxt = nullptr;
+    switch (currentMode) {
+      case MODE_1_1:  modeTxt = "1/1"; break;
+      case MODE_25_5: modeTxt = "25/5"; break;
+      case MODE_50_10: modeTxt = "50/10"; break;
+      default: modeTxt = "25/5"; break;
+    }
+    int16_t modeCenterX = gfx->width() / 2;
+    int16_t modeY = 30;  // Top of screen
+    
+    gfx->setFont(nullptr);
+    gfx->setTextSize(3, 3, 0);
+    gfx->getTextBounds(modeTxt, 0, 0, &x1, &y1, &w, &h);
+    
+    padding = 4;
+    modeBtnLeft   = modeCenterX - (int16_t)w / 2 - padding;
+    modeBtnRight  = modeCenterX + (int16_t)w / 2 + padding;
+    modeBtnTop    = modeY - (int16_t)h - padding;
+    modeBtnBottom = modeY + padding;
+    
+    // Draw 1-pixel border around mode button
+    gfx->drawRect(modeBtnLeft, modeBtnTop,
+                  modeBtnRight - modeBtnLeft,
+                  modeBtnBottom - modeBtnTop,
+                  COLOR_GOLD);
+    
+    // Draw mode text centered inside the button
+    int16_t modeBtnCenterY = (modeBtnTop + modeBtnBottom) / 2;
+    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, COLOR_GOLD, 3);
+    modeBtnValid = true;
+    lastDisplayedMode = currentMode;
   } else {
     // Update progress circle - update more frequently for smoother animation
     drawProgressCircle(progress, centerX, centerY, radius);
@@ -714,6 +818,65 @@ void drawTimer() {
     drawCenteredText(statusTxt, statusCenterX, btnCenterY, statusColor, 3);
     statusBtnValid = true;
     lastDisplayedState = currentState;
+  }
+  
+  // Update mode button if mode changed
+  if (currentMode != lastDisplayedMode) {
+    const char *modeTxt = nullptr;
+    switch (currentMode) {
+      case MODE_1_1:  modeTxt = "1/1"; break;
+      case MODE_25_5: modeTxt = "25/5"; break;
+      case MODE_50_10: modeTxt = "50/10"; break;
+      default: modeTxt = "25/5"; break;
+    }
+    
+    // Erase old mode button if it existed
+    if (modeBtnValid && lastDisplayedMode != MODE_25_5) {
+      const char *oldModeTxt = nullptr;
+      switch (lastDisplayedMode) {
+        case MODE_1_1:  oldModeTxt = "1/1"; break;
+        case MODE_25_5: oldModeTxt = "25/5"; break;
+        case MODE_50_10: oldModeTxt = "50/10"; break;
+        default: oldModeTxt = "25/5"; break;
+      }
+      gfx->fillRect(modeBtnLeft, modeBtnTop,
+                    modeBtnRight - modeBtnLeft,
+                    modeBtnBottom - modeBtnTop,
+                    COLOR_BLACK);
+    }
+    
+    int16_t modeCenterX = gfx->width() / 2;
+    int16_t modeY = 30;
+    
+    int16_t x1, y1;
+    uint16_t w, h;
+    gfx->setFont(nullptr);
+    gfx->setTextSize(3, 3, 0);
+    gfx->getTextBounds(modeTxt, 0, 0, &x1, &y1, &w, &h);
+    
+    int padding = 4;
+    modeBtnLeft   = modeCenterX - (int16_t)w / 2 - padding;
+    modeBtnRight  = modeCenterX + (int16_t)w / 2 + padding;
+    modeBtnTop    = modeY - (int16_t)h - padding;
+    modeBtnBottom = modeY + padding;
+    
+    // Erase old button area
+    gfx->fillRect(modeBtnLeft, modeBtnTop,
+                  modeBtnRight - modeBtnLeft,
+                  modeBtnBottom - modeBtnTop,
+                  COLOR_BLACK);
+    
+    // Draw new border
+    gfx->drawRect(modeBtnLeft, modeBtnTop,
+                  modeBtnRight - modeBtnLeft,
+                  modeBtnBottom - modeBtnTop,
+                  COLOR_GOLD);
+    
+    // Draw text
+    int16_t modeBtnCenterY = (modeBtnTop + modeBtnBottom) / 2;
+    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, COLOR_GOLD, 3);
+    modeBtnValid = true;
+    lastDisplayedMode = currentMode;
   }
 }
 
