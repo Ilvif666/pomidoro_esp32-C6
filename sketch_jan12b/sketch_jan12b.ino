@@ -250,15 +250,14 @@ void drawCenteredText(const char *txt, int16_t cx, int16_t cy, uint16_t color, u
 }
 
 // --- Pomodoro control functions ---
-void triggerFlash(uint16_t color) {
-  flashActive = true;
-  flashColor = color;
-  flashStartTime = millis();
+// Helper function to get current UI color based on work/rest session
+uint16_t getCurrentUIColor() {
+  return isWorkSession ? COLOR_GOLD : COLOR_BLUE;
 }
 
 void displayStoppedState(); // forward
 void drawTimer();           // forward
-void drawProgressCircle(float progress, int centerX, int centerY, int radius);
+void drawProgressCircle(float progress, int centerX, int centerY, int radius, uint16_t color);
 
 void startTimer() {
   currentState = RUNNING;
@@ -317,12 +316,12 @@ void updateTimer() {
     if (elapsed >= duration) {
       if (isWorkSession) {
         isWorkSession = false;
-        triggerFlash(COLOR_BLUE);
         startTime = millis();
+        displayInitialized = false;  // Force redraw to update colors
       } else {
         isWorkSession = true;
-        triggerFlash(COLOR_GOLD);
         startTime = millis();
+        displayInitialized = false;  // Force redraw to update colors
       }
     }
   }
@@ -604,20 +603,6 @@ void handleTouchInput() {
 }
 
 void updateDisplay() {
-  if (flashActive) {
-    if (millis() - flashStartTime < FLASH_DURATION) {
-      gfx->fillScreen(flashColor);
-    } else {
-      flashActive = false;
-      if (currentState == STOPPED) {
-        displayStoppedState();
-      } else {
-        drawTimer();
-      }
-    }
-    return;
-  }
-
   if (currentState == STOPPED) {
     return;
   } else {
@@ -657,14 +642,17 @@ void drawTimer() {
   int centerY = gfx->height() / 2;
   int radius = 70;
   
+  // Get current UI color based on work/rest session
+  uint16_t uiColor = getCurrentUIColor();
+  
   // Only redraw everything on first call or if state changed
   if (!displayInitialized) {
     gfx->fillScreen(COLOR_BLACK);
-    drawProgressCircle(progress, centerX, centerY, radius);
+    drawProgressCircle(progress, centerX, centerY, radius, uiColor);
     displayInitialized = true;
     
     const char *statusTxt = nullptr;
-    uint16_t statusColor = COLOR_GOLD;
+    uint16_t statusColor = uiColor;
     // Status button text: when running -> "pause", when paused -> "start"
     if (currentState == PAUSED) {
       statusTxt = "start";
@@ -674,7 +662,6 @@ void drawTimer() {
       statusTxt = "work";
     } else {
       statusTxt = "rest";
-      statusColor = COLOR_BLUE;
     }
     int16_t statusCenterX = gfx->width() / 2;
     int16_t statusY = gfx->height() - 30;
@@ -713,32 +700,35 @@ void drawTimer() {
       default: modeTxt = "25/5"; break;
     }
     int16_t modeCenterX = gfx->width() / 2;
-    int16_t modeY = 30;  // Top of screen
-    
+    // Calculate modeY so that top margin equals bottom margin (24px)
+    // statusBtnBottom = height() - 30 + 6 = height() - 24, so bottom margin = 24
+    // modeBtnTop should be 24, so modeY = 24 + h + padding
     gfx->setFont(nullptr);
     gfx->setTextSize(3, 3, 0);
     gfx->getTextBounds(modeTxt, 0, 0, &x1, &y1, &w, &h);
     
     padding = 4;
+    int16_t topMargin = 24;  // Same as bottom margin (height() - 30 + 6 = 24)
+    int16_t modeY = topMargin + (int16_t)h + padding;  // Position so top margin = 24px
     modeBtnLeft   = modeCenterX - (int16_t)w / 2 - padding;
     modeBtnRight  = modeCenterX + (int16_t)w / 2 + padding;
-    modeBtnTop    = modeY - (int16_t)h - padding;
+    modeBtnTop    = topMargin;  // 24px from top
     modeBtnBottom = modeY + padding;
     
     // Draw 1-pixel border around mode button
     gfx->drawRect(modeBtnLeft, modeBtnTop,
                   modeBtnRight - modeBtnLeft,
                   modeBtnBottom - modeBtnTop,
-                  COLOR_GOLD);
+                  uiColor);
     
     // Draw mode text centered inside the button
     int16_t modeBtnCenterY = (modeBtnTop + modeBtnBottom) / 2;
-    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, COLOR_GOLD, 3);
+    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, uiColor, 3);
     modeBtnValid = true;
     lastDisplayedMode = currentMode;
   } else {
     // Update progress circle - update more frequently for smoother animation
-    drawProgressCircle(progress, centerX, centerY, radius);
+    drawProgressCircle(progress, centerX, centerY, radius, uiColor);
   }
   
   // Update time text only if it changed (optimize to avoid flickering)
@@ -749,8 +739,8 @@ void drawTimer() {
       drawCenteredText(lastTimeStr, centerX, centerY, COLOR_BLACK, 3);
     }
     
-    // Draw new time in gold
-    drawCenteredText(timeStr, centerX, centerY, COLOR_GOLD, 3);
+    // Draw new time with current UI color (gold for work, blue for rest)
+    drawCenteredText(timeStr, centerX, centerY, uiColor, 3);
     strcpy(lastTimeStr, timeStr);
   }
   
@@ -758,7 +748,7 @@ void drawTimer() {
   if (currentState != lastDisplayedState) {
     // Determine new status text and color
     const char *statusTxt = nullptr;
-    uint16_t statusColor = COLOR_GOLD;
+    uint16_t statusColor = uiColor;  // Use current UI color (gold for work, blue for rest)
     if (currentState == PAUSED) {
       statusTxt = "start";
     } else if (currentState == RUNNING) {
@@ -767,7 +757,6 @@ void drawTimer() {
       statusTxt = "work";
     } else {
       statusTxt = "rest";
-      statusColor = COLOR_BLUE;
     }
     
     // Erase old status by drawing it in black (if we had one)
@@ -846,8 +835,7 @@ void drawTimer() {
     }
     
     int16_t modeCenterX = gfx->width() / 2;
-    int16_t modeY = 30;
-    
+    // Calculate modeY so that top margin equals bottom margin (24px)
     int16_t x1, y1;
     uint16_t w, h;
     gfx->setFont(nullptr);
@@ -855,9 +843,11 @@ void drawTimer() {
     gfx->getTextBounds(modeTxt, 0, 0, &x1, &y1, &w, &h);
     
     int padding = 4;
+    int16_t topMargin = 24;  // Same as bottom margin (height() - 30 + 6 = 24)
+    int16_t modeY = topMargin + (int16_t)h + padding;  // Position so top margin = 24px
     modeBtnLeft   = modeCenterX - (int16_t)w / 2 - padding;
     modeBtnRight  = modeCenterX + (int16_t)w / 2 + padding;
-    modeBtnTop    = modeY - (int16_t)h - padding;
+    modeBtnTop    = topMargin;  // 24px from top
     modeBtnBottom = modeY + padding;
     
     // Erase old button area
@@ -870,26 +860,34 @@ void drawTimer() {
     gfx->drawRect(modeBtnLeft, modeBtnTop,
                   modeBtnRight - modeBtnLeft,
                   modeBtnBottom - modeBtnTop,
-                  COLOR_GOLD);
+                  uiColor);
     
     // Draw text
     int16_t modeBtnCenterY = (modeBtnTop + modeBtnBottom) / 2;
-    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, COLOR_GOLD, 3);
+    drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, uiColor, 3);
     modeBtnValid = true;
     lastDisplayedMode = currentMode;
   }
 }
 
-void drawProgressCircle(float progress, int centerX, int centerY, int radius) {
+void drawProgressCircle(float progress, int centerX, int centerY, int radius, uint16_t color) {
   static float lastProgress = -1.0f;
   static bool circleDrawn = false;
+  static uint16_t lastColor = COLOR_GOLD;
   int borderWidth = 5;
+  
+  // Redraw full circle if color changed (work <-> rest transition)
+  if (lastColor != color) {
+    circleDrawn = false;
+    lastProgress = -1.0f;  // Force full redraw
+    lastColor = color;
+  }
   
   // Only redraw full circle on first call or if progress reset (timer restarted)
   if (!circleDrawn || progress < lastProgress || lastProgress < 0) {
-    // Draw the full circle border (same as splash screen)
+    // Draw the full circle border with current color
     for (int16_t i = 0; i < borderWidth; i++) {
-      gfx->drawCircle(centerX, centerY, radius - i, COLOR_GOLD);
+      gfx->drawCircle(centerX, centerY, radius - i, color);
     }
     circleDrawn = true;
     if (progress < lastProgress || lastProgress < 0) {
