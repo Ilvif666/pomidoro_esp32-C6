@@ -181,6 +181,9 @@ const unsigned long SHORT_TAP_BLOCK_MS = 1500;  // Block short taps for 1.5s aft
 static bool displayInitialized = false;
 static char lastTimeStr[6] = "";
 static TimerState lastDisplayedState = STOPPED;  // Track state changes for status update
+// Time display mode: false = MM:SS, true = MM only
+static bool showMinutesOnly = false;
+static bool lastShowMinutesOnly = false;  // Track mode changes for redraw
 
 // Status button bounds (for pause/start button at bottom)
 static int16_t statusBtnLeft = 0;
@@ -210,7 +213,7 @@ static int16_t tapIndicatorY = 0;
 const unsigned long TAP_INDICATOR_DURATION = 500;  // ms
 
 // Tap indicator radius (used for drawing / visual size)
-static const int TAP_RADIUS = 8;
+static const int TAP_RADIUS = 4;  // Twice smaller than before (was 8)
 
 // --- Helper: draw golden "R" splash (used as stopped screen) ---
 void drawSplash() {
@@ -512,6 +515,20 @@ void handleTouchInput() {
           inStatusButton = true;
         }
       }
+      
+      // Check for tap inside the timer circle (to toggle MM:SS <-> MM display)
+      bool inCircle = false;
+      if (lastTouchValid && tx >= 0 && ty >= 0 && (currentState == RUNNING || currentState == PAUSED)) {
+        int16_t centerX = gfx->width() / 2;
+        int16_t centerY = gfx->height() / 2;
+        int16_t radius = 70;
+        int16_t dx = tx - centerX;
+        int16_t dy = ty - centerY;
+        int16_t distSquared = dx * dx + dy * dy;
+        if (distSquared <= radius * radius) {
+          inCircle = true;
+        }
+      }
 
       if (inModeButton) {
         // Cycle through modes: 1/1 -> 25/5 -> 50/10 -> 1/1
@@ -533,6 +550,16 @@ void handleTouchInput() {
         }
         // Force immediate mode button update
         lastDisplayedMode = oldMode;
+        updateDisplay();
+      } else if (inCircle) {
+        // Toggle time display mode (MM:SS <-> MM)
+        Serial.println("*** CIRCLE TAPPED - TOGGLE TIME DISPLAY MODE ***");
+        showMinutesOnly = !showMinutesOnly;
+        Serial.print("-> Switched to ");
+        Serial.println(showMinutesOnly ? "MM only" : "MM:SS");
+        // Force immediate time display update
+        lastShowMinutesOnly = !showMinutesOnly;  // Force redraw
+        strcpy(lastTimeStr, "");  // Clear last time string to force redraw
         updateDisplay();
       } else if (inStatusButton && (currentState == RUNNING || currentState == PAUSED)) {
         Serial.println("*** STATUS BUTTON CLICKED ***");
@@ -631,8 +658,13 @@ void drawTimer() {
   unsigned long minutes = remaining / 60000UL;
   unsigned long seconds = (remaining % 60000UL) / 1000UL;
 
-  char timeStr[6];
-  sprintf(timeStr, "%02lu:%02lu", minutes, seconds);
+  // Format time string based on display mode
+  char timeStr[10];
+  if (showMinutesOnly) {
+    sprintf(timeStr, "%02lu", minutes);  // MM only
+  } else {
+    sprintf(timeStr, "%02lu:%02lu", minutes, seconds);  // MM:SS
+  }
 
   float progress = (float)elapsed / (float)duration;
   if (progress < 0) progress = 0;
@@ -726,22 +758,32 @@ void drawTimer() {
     drawCenteredText(modeTxt, modeCenterX, modeBtnCenterY, uiColor, 3);
     modeBtnValid = true;
     lastDisplayedMode = currentMode;
+    
+    // Draw initial time text
+    uint8_t textSize = showMinutesOnly ? 5 : 3;
+    drawCenteredText(timeStr, centerX, centerY, uiColor, textSize);
+    strcpy(lastTimeStr, timeStr);
+    lastShowMinutesOnly = showMinutesOnly;
   } else {
     // Update progress circle - update more frequently for smoother animation
     drawProgressCircle(progress, centerX, centerY, radius, uiColor);
   }
   
-  // Update time text only if it changed (optimize to avoid flickering)
-  if (strcmp(timeStr, lastTimeStr) != 0) {
-    // Erase old text by drawing it in black color (more efficient than fillRect)
-    if (lastTimeStr[0] != '\0') {
-      // Draw old text in black to erase it
-      drawCenteredText(lastTimeStr, centerX, centerY, COLOR_BLACK, 3);
-    }
+  // Update time text if it changed or display mode changed
+  if (strcmp(timeStr, lastTimeStr) != 0 || showMinutesOnly != lastShowMinutesOnly) {
+    // Clear the text area inside the circle by filling a rectangle
+    // Circle radius is 70, so we fill a safe rectangle inside it (100x60 pixels)
+    int16_t textAreaWidth = 100;
+    int16_t textAreaHeight = 60;
+    int16_t textAreaLeft = centerX - textAreaWidth / 2;
+    int16_t textAreaTop = centerY - textAreaHeight / 2;
+    gfx->fillRect(textAreaLeft, textAreaTop, textAreaWidth, textAreaHeight, COLOR_BLACK);
     
-    // Draw new time with current UI color (gold for work, blue for rest)
-    drawCenteredText(timeStr, centerX, centerY, uiColor, 3);
+    // Draw new time with current UI color and appropriate size
+    uint8_t textSize = showMinutesOnly ? 5 : 3;  // Larger text for MM only mode
+    drawCenteredText(timeStr, centerX, centerY, uiColor, textSize);
     strcpy(lastTimeStr, timeStr);
+    lastShowMinutesOnly = showMinutesOnly;
   }
   
   // Update status text if state changed
