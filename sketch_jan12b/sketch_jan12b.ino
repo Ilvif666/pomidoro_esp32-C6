@@ -126,6 +126,28 @@ const uint16_t COLOR_BLACK = 0x0000;
 const uint16_t COLOR_GOLD  = 0xFCE0; // tuned golden
 const uint16_t COLOR_BLUE  = 0x001F;
 const uint16_t COLOR_GREEN = 0x07E0;
+const uint16_t COLOR_RED   = 0xF800;
+const uint16_t COLOR_COFFEE = 0x8200; // Brown/coffee color
+const uint16_t COLOR_CYAN   = 0x07FF;
+const uint16_t COLOR_MAGENTA = 0xF81F;
+const uint16_t COLOR_YELLOW = 0xFFE0;
+const uint16_t COLOR_ORANGE = 0xFBF9; // Pink (rgb(255,192,203))
+const uint16_t COLOR_PURPLE = 0x780F; // Purple
+const uint16_t COLOR_PINK = 0xFC1F;   // Pink
+const uint16_t COLOR_TEAL = 0x07EF;   // Teal
+const uint16_t COLOR_LIME = 0x87E0;   // Lime green
+const uint16_t COLOR_INDIGO = 0x4810; // Indigo
+const uint16_t COLOR_CORAL = 0xFA00;  // International Orange (#ff4f00, rgb(255,79,0))
+const uint16_t COLOR_LAVENDER = 0x9C1F; // Lavender
+const uint16_t COLOR_EMERALD = 0x07D0; // Emerald green
+const uint16_t COLOR_WHITE = 0xFFFF;  // White
+const uint16_t COLOR_DARK_BLUE = 0x000F; // Dark blue
+const uint16_t COLOR_OLIVE = 0x8400;   // Olive green
+const uint16_t COLOR_TURQUOISE = 0x04FF; // Turquoise (more contrast than teal)
+const uint16_t COLOR_VIOLET = 0x901A;  // Violet (more contrast than purple)
+const uint16_t COLOR_SALMON = 0xFC60;  // Salmon
+const uint16_t COLOR_MINT = 0x87FF;    // Mint green (lighter than cyan)
+const uint16_t COLOR_NAVY = 0x0010;    // Navy blue
 
 // --- Pomodoro logic ---
 enum TimerState {
@@ -335,12 +357,62 @@ void drawGrid() {
   // Center the grid horizontally
   int16_t gridStartX = (screenWidth - gridWidth) / 2;
   
-  // Draw grid lines (golden color)
-  uint16_t gridColor = COLOR_GOLD;
+  // Grid lines color (black)
+  uint16_t gridColor = COLOR_BLACK;
   
-  // Calculate last row Y position
+  // Calculate last row Y position (last row is for buttons, skip it)
   int16_t lastRowY = (numRows - 1) * cellHeight;
   
+  // Array of unique colors sorted by gradient with high contrast
+  // Main colors: golden (0xFCE0 - same as logo/buttons), red, blue, green, coffee, cyan
+  // Removed similar colors (emerald/green, teal/cyan, lavender/purple, pink/magenta)
+  // Sorted from warm to cool with maximum contrast
+  uint16_t cellColors[] = {
+    COLOR_RED,         // 0 - Red
+    COLOR_ORANGE,      // 1 - Pink
+    COLOR_CORAL,       // 2 - International Orange (#ff4f00)
+    COLOR_YELLOW,      // 3 - Yellow
+    COLOR_LIME,        // 4 - Lime green
+    COLOR_GREEN,       // 5 - Green
+    COLOR_MINT,        // 6 - Mint green (lighter cyan)
+    COLOR_CYAN,        // 7 - Cyan
+    COLOR_TURQUOISE,   // 8 - Turquoise
+    COLOR_BLUE,        // 9 - Blue
+    COLOR_DARK_BLUE,   // 10 - Dark blue
+    COLOR_NAVY,        // 11 - Navy blue
+    COLOR_INDIGO,      // 12 - Indigo
+    COLOR_VIOLET,      // 13 - Violet
+    COLOR_PURPLE,      // 14 - Purple
+    COLOR_MAGENTA,     // 15 - Magenta
+    COLOR_GOLD,        // 16 - Golden (0xFCE0 - main color, same as logo/buttons) - moved to one before last
+    COLOR_COFFEE       // 17 - Coffee/Brown
+  };
+  
+  // Calculate number of cells to fill (all rows except last one)
+  int numCellsToFill = (numRows - 1) * 3;  // 6 rows * 3 cols = 18 cells
+  int numColors = sizeof(cellColors) / sizeof(cellColors[0]);
+  
+  // Fill grid cells with unique colors (no repetition, sorted by gradient)
+  int colorIndex = 0;
+  for (int row = 0; row < numRows - 1; row++) {
+    for (int col = 0; col < 3; col++) {
+      int16_t cellX = gridStartX + col * cellWidth;
+      int16_t cellY = row * cellHeight;
+      
+      // Use unique color (no modulo, just use index directly)
+      uint16_t cellColor = cellColors[colorIndex];
+      
+      // Fill the cell with color
+      gfx->fillRect(cellX, cellY, cellWidth, cellHeight, cellColor);
+      
+      colorIndex++;
+      // Safety check: if we run out of colors, stop
+      if (colorIndex >= numColors) break;
+    }
+    if (colorIndex >= numColors) break;
+  }
+  
+  // Draw grid lines (black) on top of colored cells
   // Draw vertical lines (column separators) - skip outer borders
   // Draw only inner vertical lines (between columns 1-2 and 2-3)
   // BUT: don't draw them in the last row (bottom row is merged)
@@ -406,16 +478,16 @@ void drawGrid() {
   gridCancelBtnTop    = bottomRowCenterY - btnHeight / 2;
   gridCancelBtnBottom = bottomRowCenterY + btnHeight / 2;
   
-  // Draw border around cancel button
+  // Draw border around cancel button (golden color)
   gfx->drawRect(gridCancelBtnLeft, gridCancelBtnTop,
                 btnWidth,
                 btnHeight,
-                gridColor);
+                COLOR_GOLD);
   
   // Draw "X" text centered with slight offset (right and down) for better visual centering
   int16_t textOffsetX = 2;  // Move right a bit
   int16_t textOffsetY = 2;  // Move down a bit
-  drawCenteredText(cancelTxt, cancelCenterX + textOffsetX, bottomRowCenterY + textOffsetY, gridColor, textSize);
+  drawCenteredText(cancelTxt, cancelCenterX + textOffsetX, bottomRowCenterY + textOffsetY, COLOR_GOLD, textSize);
   gridCancelBtnValid = true;
   
   // Right button "V" (checkmark)
@@ -426,14 +498,14 @@ void drawGrid() {
   gridConfirmBtnTop    = bottomRowCenterY - btnHeight / 2;
   gridConfirmBtnBottom = bottomRowCenterY + btnHeight / 2;
   
-  // Draw border around confirm button
+  // Draw border around confirm button (golden color)
   gfx->drawRect(gridConfirmBtnLeft, gridConfirmBtnTop,
                 btnWidth,
                 btnHeight,
-                gridColor);
+                COLOR_GOLD);
   
   // Draw "V" text centered with slight offset (right and down) for better visual centering
-  drawCenteredText(confirmTxt, confirmCenterX + textOffsetX, bottomRowCenterY + textOffsetY, gridColor, textSize);
+  drawCenteredText(confirmTxt, confirmCenterX + textOffsetX, bottomRowCenterY + textOffsetY, COLOR_GOLD, textSize);
   gridConfirmBtnValid = true;
 }
 
