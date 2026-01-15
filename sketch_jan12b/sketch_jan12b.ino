@@ -181,6 +181,10 @@ TimerState currentState = STOPPED;
 PomodoroMode currentMode = MODE_25_5;  // Default to standard 25/5 mode
 // View mode: false = normal view, true = grid view
 bool gridViewActive = false;
+// Selected color in grid view
+uint16_t selectedGridColor = 0;
+int16_t selectedGridRow = -1;  // -1 means no selection
+int16_t selectedGridCol = -1;  // -1 means no selection
 unsigned long startTime = 0;
 unsigned long pausedTime = 0;
 unsigned long elapsedBeforePause = 0;
@@ -405,6 +409,20 @@ void drawGrid() {
       // Fill the cell with color
       gfx->fillRect(cellX, cellY, cellWidth, cellHeight, cellColor);
       
+      // Draw thick white border if this cell is selected (4px inside, filling space between outer and inner square)
+      if (selectedGridRow == row && selectedGridCol == col) {
+        int borderWidth = 4;
+        // Fill the border area with white (thick frame between outer edge and inner square)
+        // Top border
+        gfx->fillRect(cellX, cellY, cellWidth, borderWidth, COLOR_WHITE);
+        // Bottom border
+        gfx->fillRect(cellX, cellY + cellHeight - borderWidth, cellWidth, borderWidth, COLOR_WHITE);
+        // Left border
+        gfx->fillRect(cellX, cellY + borderWidth, borderWidth, cellHeight - borderWidth * 2, COLOR_WHITE);
+        // Right border
+        gfx->fillRect(cellX + cellWidth - borderWidth, cellY + borderWidth, borderWidth, cellHeight - borderWidth * 2, COLOR_WHITE);
+      }
+      
       colorIndex++;
       // Safety check: if we run out of colors, stop
       if (colorIndex >= numColors) break;
@@ -418,7 +436,7 @@ void drawGrid() {
   // BUT: don't draw them in the last row (bottom row is merged)
   for (int col = 1; col < 3; col++) {
     int16_t x = gridStartX + col * cellWidth;
-    // Draw line from top to just before last row
+    // Draw line from top to just before last row (always gridColor)
     gfx->drawFastVLine(x, 0, lastRowY, gridColor);
   }
   
@@ -507,6 +525,74 @@ void drawGrid() {
   // Draw "V" text centered with slight offset (right and down) for better visual centering
   drawCenteredText(confirmTxt, confirmCenterX + textOffsetX, bottomRowCenterY + textOffsetY, COLOR_GOLD, textSize);
   gridConfirmBtnValid = true;
+}
+
+// Helper: return color for a given grid cell (row, col)
+uint16_t getGridCellColor(int row, int col) {
+  int16_t cellWidth = 43;
+  int16_t cellHeight = 43;
+  int16_t numRows = gfx->height() / cellHeight;  // 7 rows
+  // Validate bounds (ignore last row which is for buttons)
+  if (row < 0 || col < 0 || col >= 3 || row >= numRows - 1) return COLOR_BLACK;
+
+  uint16_t cellColors[] = {
+    COLOR_RED, COLOR_ORANGE, COLOR_CORAL, COLOR_YELLOW, COLOR_LIME,
+    COLOR_GREEN, COLOR_MINT, COLOR_CYAN, COLOR_TURQUOISE, COLOR_BLUE,
+    COLOR_DARK_BLUE, COLOR_NAVY, COLOR_INDIGO, COLOR_VIOLET, COLOR_PURPLE,
+    COLOR_MAGENTA, COLOR_GOLD, COLOR_COFFEE
+  };
+  int colorIndex = row * 3 + col;
+  int numColors = sizeof(cellColors) / sizeof(cellColors[0]);
+  if (colorIndex < 0 || colorIndex >= numColors) return COLOR_BLACK;
+  return cellColors[colorIndex];
+}
+
+// Helper: redraw a single grid cell to reduce flicker
+void redrawGridCell(int row, int col, bool selected) {
+  int16_t screenWidth = gfx->width();   // 172
+  int16_t screenHeight = gfx->height(); // 320
+  int16_t cellWidth = 43;
+  int16_t cellHeight = 43;
+  int16_t numRows = screenHeight / cellHeight;  // 7 rows
+  if (row < 0 || col < 0 || col >= 3 || row >= numRows - 1) return;  // skip last row (buttons)
+
+  int16_t gridWidth = 3 * cellWidth;
+  int16_t gridStartX = (screenWidth - gridWidth) / 2;
+  int16_t cellX = gridStartX + col * cellWidth;
+  int16_t cellY = row * cellHeight;
+
+  uint16_t cellColor = getGridCellColor(row, col);
+  uint16_t gridColor = COLOR_BLACK;
+
+  // Fill cell
+  gfx->fillRect(cellX, cellY, cellWidth, cellHeight, cellColor);
+
+  // Redraw grid lines around this cell (black)
+  if (col > 0) {
+    gfx->drawFastVLine(cellX, cellY, cellHeight, gridColor);
+  }
+  if (col < 2) {
+    gfx->drawFastVLine(cellX + cellWidth, cellY, cellHeight, gridColor);
+  }
+  if (row > 0) {
+    gfx->drawFastHLine(cellX, cellY, cellWidth, gridColor);
+  }
+  if (row < numRows - 2) {  // not the row above bottom merged row
+    gfx->drawFastHLine(cellX, cellY + cellHeight, cellWidth, gridColor);
+  }
+
+  // Draw thick white frame on top (inside the cell) if selected
+  if (selected) {
+    int borderWidth = 4;
+    // Top border
+    gfx->fillRect(cellX, cellY, cellWidth, borderWidth, COLOR_WHITE);
+    // Bottom border
+    gfx->fillRect(cellX, cellY + cellHeight - borderWidth, cellWidth, borderWidth, COLOR_WHITE);
+    // Left border
+    gfx->fillRect(cellX, cellY + borderWidth, borderWidth, cellHeight - borderWidth * 2, COLOR_WHITE);
+    // Right border
+    gfx->fillRect(cellX + cellWidth - borderWidth, cellY + borderWidth, borderWidth, cellHeight - borderWidth * 2, COLOR_WHITE);
+  }
 }
 
 // --- Helper: centered text using getTextBounds ---
@@ -697,7 +783,7 @@ void readTouchData() {
           // touch_num is 0 in data, but TP_INT is still LOW - don't reset yet
           // Keep previous touch_num value to maintain touch state
         }
-      } else {
+    } else {
         // I2C read failed, but TP_INT is still LOW - keep touch state
       }
     }
@@ -774,6 +860,9 @@ void handleTouchInput() {
       // Check for grid view buttons (X and ✓) when grid is active
       bool inGridCancelButton = false;
       bool inGridConfirmButton = false;
+      bool inGridCell = false;
+      int16_t clickedGridRow = -1;
+      int16_t clickedGridCol = -1;
       if (gridViewActive && lastTouchValid && tx >= 0 && ty >= 0) {
         if (gridCancelBtnValid) {
           if (tx >= gridCancelBtnLeft && tx <= gridCancelBtnRight &&
@@ -785,6 +874,32 @@ void handleTouchInput() {
           if (tx >= gridConfirmBtnLeft && tx <= gridConfirmBtnRight &&
               ty >= gridConfirmBtnTop  && ty <= gridConfirmBtnBottom) {
             inGridConfirmButton = true;
+          }
+        }
+        
+        // Check if click is inside a grid cell (not in buttons)
+        if (!inGridCancelButton && !inGridConfirmButton) {
+          int16_t screenWidth = gfx->width();   // 172
+          int16_t screenHeight = gfx->height(); // 320
+          int16_t cellWidth = 43;
+          int16_t cellHeight = 43;
+          int16_t numRows = screenHeight / cellHeight;  // 7 rows
+          int16_t gridWidth = 3 * cellWidth;
+          int16_t gridStartX = (screenWidth - gridWidth) / 2;
+          int16_t lastRowY = (numRows - 1) * cellHeight;
+          
+          // Check if click is within grid bounds
+          if (tx >= gridStartX && tx < gridStartX + gridWidth &&
+              ty >= 0 && ty < lastRowY) {
+            // Calculate which cell was clicked
+            clickedGridCol = (tx - gridStartX) / cellWidth;
+            clickedGridRow = ty / cellHeight;
+            
+            // Verify it's a valid cell (not in last row which is for buttons)
+            if (clickedGridRow >= 0 && clickedGridRow < numRows - 1 &&
+                clickedGridCol >= 0 && clickedGridCol < 3) {
+              inGridCell = true;
+            }
           }
         }
       }
@@ -839,10 +954,36 @@ void handleTouchInput() {
         }
       }
 
-      if (inGridCancelButton) {
+      if (inGridCell) {
+        // Grid cell clicked - select the color
+        int16_t prevRow = selectedGridRow;
+        int16_t prevCol = selectedGridCol;
+
+        selectedGridRow = clickedGridRow;
+        selectedGridCol = clickedGridCol;
+
+        // Get color for this cell
+        selectedGridColor = getGridCellColor(clickedGridRow, clickedGridCol);
+        
+        Serial.print("*** GRID CELL CLICKED: row=");
+        Serial.print(selectedGridRow);
+        Serial.print(", col=");
+        Serial.print(selectedGridCol);
+        Serial.print(", color=0x");
+        Serial.println(selectedGridColor, HEX);
+        
+        // Redraw only affected cells to avoid full-screen flicker
+        if (prevRow >= 0 && prevCol >= 0) {
+          redrawGridCell(prevRow, prevCol, false);
+        }
+        redrawGridCell(selectedGridRow, selectedGridCol, true);
+      } else if (inGridCancelButton) {
         // X button clicked in grid view - return to home screen
         Serial.println("*** GRID CANCEL (X) BUTTON CLICKED ***");
         gridViewActive = false;
+        selectedGridRow = -1;  // Clear selection
+        selectedGridCol = -1;
+        selectedGridColor = 0;
         displayStoppedState();  // Return to home screen
       } else if (inGridConfirmButton) {
         // ✓ button clicked in grid view
@@ -852,6 +993,9 @@ void handleTouchInput() {
         // Work button clicked on home screen - show grid view
         Serial.println("*** WORK BUTTON CLICKED ***");
         gridViewActive = true;
+        selectedGridRow = -1;  // Clear selection when opening grid
+        selectedGridCol = -1;
+        selectedGridColor = 0;
         drawGrid();
       } else if (inRestButton) {
         // Rest button clicked on home screen
@@ -973,7 +1117,7 @@ void updateDisplay() {
     
     // Update every 1000ms (1 second) exactly
     if (now - lastDisplayUpdate >= 1000) {
-      drawTimer();
+    drawTimer();
       lastDisplayUpdate = now;  // Use current time, not lastDisplayUpdate + 1000, to prevent drift
     }
   }
@@ -986,7 +1130,7 @@ void drawTimer() {
   } else if (currentState == PAUSED) {
     elapsed = elapsedBeforePause;
   }
-
+  
   unsigned long duration = getCurrentDuration();
   unsigned long remaining = (elapsed >= duration) ? 0 : (duration - elapsed);
   unsigned long minutes = remaining / 60000UL;
@@ -1020,13 +1164,13 @@ void drawTimer() {
     const char *statusTxt = nullptr;
     uint16_t statusColor = uiColor;
     // Status button text: when running -> "pause", when paused -> "start"
-    if (currentState == PAUSED) {
+  if (currentState == PAUSED) {
       statusTxt = "start";
     } else if (currentState == RUNNING) {
       statusTxt = "pause";
-    } else if (isWorkSession) {
+  } else if (isWorkSession) {
       statusTxt = "work";
-    } else {
+  } else {
       statusTxt = "rest";
     }
     int16_t statusCenterX = gfx->width() / 2;
