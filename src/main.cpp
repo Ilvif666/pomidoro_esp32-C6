@@ -417,6 +417,7 @@ void drawCenteredText(const char *txt, int16_t cx, int16_t cy, uint16_t color, u
 void drawGearIcon(int16_t cx, int16_t cy, int16_t size, uint16_t color);
 void drawColorPreview();
 void displayStoppedState();
+extern bool forceCircleRedraw;  // Force progress circle redraw
 
 // Save selected color to NVS (persistent storage)
 void saveSelectedColor() {
@@ -537,7 +538,17 @@ void telegramTask(void* parameter) {
         Serial.print("[TG] Command: ");
         Serial.println(text);
         
-        if (text == "/work") {
+        if (text == "/start" || text == "/help") {
+          String msg = "🍅 <b>Pomodoro Timer</b>\n\n";
+          msg += "/status - Current status\n";
+          msg += "/work - Start work\n";
+          msg += "/pause - Pause\n";
+          msg += "/resume - Resume\n";
+          msg += "/stop - Stop\n";
+          msg += "/mode - Change mode";
+          bot->sendMessage(chatId, msg, "HTML");
+        }
+        else if (text == "/work") {
           telegramCmdStart = true;
           bot->sendMessage(chatId, "🍅 Starting...", "HTML");
         }
@@ -553,10 +564,26 @@ void telegramTask(void* parameter) {
           telegramCmdStop = true;
           bot->sendMessage(chatId, "⏹ Stopping...", "HTML");
         }
+        else if (text == "/mode") {
+          telegramCmdMode = true;
+          String modeStr;
+          switch (currentMode) {
+            case MODE_1_1: modeStr = "25/5"; break;
+            case MODE_25_5: modeStr = "50/10"; break;
+            case MODE_50_10: modeStr = "1/1"; break;
+          }
+          bot->sendMessage(chatId, "⏱ Mode: " + modeStr, "HTML");
+        }
         else if (text == "/status") {
           String msg = "🍅 ";
           msg += (currentState == STOPPED) ? "Stopped" : 
                  (currentState == RUNNING) ? (isWorkSession ? "Working" : "Resting") : "Paused";
+          msg += " | ";
+          switch (currentMode) {
+            case MODE_1_1: msg += "1/1"; break;
+            case MODE_25_5: msg += "25/5"; break;
+            case MODE_50_10: msg += "50/10"; break;
+          }
           bot->sendMessage(chatId, msg, "HTML");
         }
       }
@@ -577,7 +604,8 @@ void processTelegramCommands() {
       startTime = millis();
       timerStartTime = millis();
       elapsedBeforePause = 0;
-      displayInitialized = false;  // Force display redraw
+      displayInitialized = false;
+      forceCircleRedraw = true;
     }
   }
   if (telegramCmdPause) {
@@ -587,7 +615,8 @@ void processTelegramCommands() {
       currentState = PAUSED;
       pausedTime = millis();
       elapsedBeforePause = millis() - startTime;
-      displayInitialized = false;  // Force display redraw
+      displayInitialized = false;
+      forceCircleRedraw = true;
     }
   }
   if (telegramCmdResume) {
@@ -596,7 +625,8 @@ void processTelegramCommands() {
       Serial.println("[TG CMD] Resuming timer");
       currentState = RUNNING;
       startTime = millis() - elapsedBeforePause;
-      displayInitialized = false;  // Force display redraw
+      displayInitialized = false;
+      forceCircleRedraw = true;
     }
   }
   if (telegramCmdStop) {
@@ -605,7 +635,7 @@ void processTelegramCommands() {
       Serial.println("[TG CMD] Stopping timer");
       currentState = STOPPED;
       displayInitialized = false;
-      displayStoppedState();  // Show home screen
+      displayStoppedState();
     }
   }
   if (telegramCmdMode) {
@@ -616,7 +646,8 @@ void processTelegramCommands() {
       case MODE_25_5: currentMode = MODE_50_10; break;
       case MODE_50_10: currentMode = MODE_1_1; break;
     }
-    displayInitialized = false;  // Force display redraw
+    displayInitialized = false;
+    forceCircleRedraw = true;
   }
 }
 
@@ -1863,8 +1894,8 @@ void drawTimer() {
   }
 }
 
-// Flag to force progress circle redraw (set on rotation change)
-static bool forceCircleRedraw = false;
+// Flag to force progress circle redraw
+bool forceCircleRedraw = false;
 
 void drawProgressCircle(float progress, int centerX, int centerY, int radius, uint16_t color) {
   static float lastProgress = -1.0f;
