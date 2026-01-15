@@ -11,8 +11,69 @@
 #include "FreeSansBold24pt7b.h"  // Smooth font for the logo and titles
 #include "esp_lcd_touch_axs5106l.h"
 
+// WiFi and Telegram includes
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+
 // Preferences for persistent storage
 Preferences preferences;
+
+// ==================== WiFi & Telegram Configuration ====================
+// WiFi credentials from platformio.ini build flags
+#ifndef WIFI_SSID
+  #define WIFI_SSID "YOUR_WIFI_SSID"
+#endif
+#ifndef WIFI_PASSWORD
+  #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+#endif
+#ifndef TELEGRAM_BOT_TOKEN
+  #define TELEGRAM_BOT_TOKEN ""
+#endif
+#ifndef TELEGRAM_CHAT_ID
+  #define TELEGRAM_CHAT_ID ""
+#endif
+
+// WiFi and Telegram state
+bool wifiConnected = false;
+bool telegramConfigured = false;
+
+// Use build flags for bot token and chat_id
+const char* botToken = TELEGRAM_BOT_TOKEN;
+const char* chatId = TELEGRAM_CHAT_ID;
+
+// WiFi client for Telegram
+WiFiClientSecure telegramClient;
+UniversalTelegramBot* bot = nullptr;
+
+// Telegram bot polling interval
+const unsigned long BOT_CHECK_INTERVAL = 5000;  // Check every 5 seconds (was 2s)
+
+// FreeRTOS task handle for Telegram
+TaskHandle_t telegramTaskHandle = nullptr;
+
+// Thread-safe command queue from Telegram to main loop
+volatile bool telegramCmdStart = false;
+volatile bool telegramCmdPause = false;
+volatile bool telegramCmdResume = false;
+volatile bool telegramCmdStop = false;
+volatile bool telegramCmdMode = false;
+
+// Outgoing message queue (main loop -> telegram task)
+#define MSG_QUEUE_SIZE 3
+QueueHandle_t telegramMsgQueue = nullptr;
+struct TelegramMsg {
+  char text[128];
+};
+
+// Last queued message to prevent duplicates
+char lastQueuedMessage[128] = "";
+unsigned long lastSentTime = 0;
+const unsigned long SEND_COOLDOWN = 3000;  // 3 second cooldown between sends
+
+// Mutex for telegram operations
+SemaphoreHandle_t telegramMutex = nullptr;
 
 // IMU (QMI8658) for auto-rotation - shares I2C bus with touch
 #define IMU_ADDRESS 0x6B  // QMI8658 default I2C address
@@ -24,7 +85,7 @@ bool imuInitialized = false;
 // Auto-rotation variables
 uint8_t currentRotation = 0;  // Current display rotation (0-3)
 unsigned long lastRotationCheck = 0;
-const unsigned long ROTATION_CHECK_INTERVAL = 250;  // Check every 250ms
+const unsigned long ROTATION_CHECK_INTERVAL = 2000;  // Check every 2 seconds (was 500ms)
 const float ROTATION_THRESHOLD = 0.5;  // Threshold in g for rotation detection
 
 // Backlight pin (official: GPIO23 = LCD_BL)
@@ -348,10 +409,14 @@ const unsigned long TAP_INDICATOR_DURATION = 500;  // ms
 // Tap indicator radius (used for drawing / visual size)
 static const int TAP_RADIUS = 4;  // Twice smaller than before (was 8)
 
+// Extra touch padding for buttons (makes touch areas larger than visible buttons)
+static const int16_t TOUCH_PADDING = 15;  // 15px extra on each side
+
 // Forward declarations
 void drawCenteredText(const char *txt, int16_t cx, int16_t cy, uint16_t color, uint8_t size);
 void drawGearIcon(int16_t cx, int16_t cy, int16_t size, uint16_t color);
 void drawColorPreview();
+void displayStoppedState();
 
 // Save selected color to NVS (persistent storage)
 void saveSelectedColor() {
@@ -369,6 +434,213 @@ void loadSelectedColor() {
   preferences.end();
   Serial.print("Loaded color from NVS: 0x");
   Serial.println(selectedWorkColor, HEX);
+}
+
+// ==================== WiFi & Telegram Functions ====================
+
+// Connect to WiFi
+void connectWiFi() {
+  Serial.println("Connecting to WiFi...");
+  Serial.print("SSID: ");
+  Serial.println(WIFI_SSID);
+  
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    wifiConnected = true;
+    Serial.println();
+    Serial.print("WiFi connected! IP: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    wifiConnected = false;
+    Serial.println();
+    Serial.println("WiFi connection failed!");
+  }
+}
+
+// Initialize Telegram bot
+void initTelegramBot() {
+  // Check if bot token is configured
+  telegramConfigured = (strlen(botToken) > 0 && strlen(chatId) > 0);
+  
+  if (!wifiConnected || !telegramConfigured) {
+    Serial.println("Telegram not configured or WiFi not connected");
+    return;
+  }
+  
+  if (bot != nullptr) {
+    delete bot;
+  }
+  
+  telegramClient.setInsecure();  // Skip certificate verification
+  telegramClient.setTimeout(10000);  // 10 second timeout to prevent retries
+  bot = new UniversalTelegramBot(botToken, telegramClient);
+  bot->waitForResponse = 5000;  // 5 second wait for response
+  Serial.println("Telegram bot initialized");
+  
+  // Send startup message
+  bot->sendMessage(chatId, "🍅 Pomodoro Timer connected!", "HTML");
+}
+
+// Queue message to Telegram (non-blocking)
+void sendTelegramMessage(const String& message) {
+  if (!wifiConnected || !telegramConfigured || telegramMsgQueue == nullptr) {
+    return;
+  }
+  
+  TelegramMsg msg;
+  message.toCharArray(msg.text, sizeof(msg.text));
+  
+  if (xQueueSend(telegramMsgQueue, &msg, 0) == pdTRUE) {
+    Serial.print("[TG] Queued: ");
+    Serial.println(message);
+  }
+}
+
+// Telegram task - sends queued messages in background
+void telegramTask(void* parameter) {
+  Serial.println("[TG TASK] Started");
+  
+  while (true) {
+    // Send queued messages
+    TelegramMsg outMsg;
+    if (telegramMsgQueue != nullptr && xQueueReceive(telegramMsgQueue, &outMsg, 0) == pdTRUE) {
+      if (bot != nullptr) {
+        Serial.print("[TG TASK] Sending: ");
+        Serial.println(outMsg.text);
+        bot->sendMessage(chatId, outMsg.text, "HTML");
+        Serial.println("[TG TASK] Done");
+      }
+    }
+    
+    // Check for incoming commands (less frequently)
+    static unsigned long lastCheck = 0;
+    if (millis() - lastCheck > BOT_CHECK_INTERVAL && bot != nullptr) {
+      lastCheck = millis();
+      int numNewMessages = bot->getUpdates(bot->last_message_received + 1);
+      
+      for (int i = 0; i < numNewMessages; i++) {
+        String text = bot->messages[i].text;
+        String from_id = bot->messages[i].chat_id;
+        
+        if (from_id != String(chatId)) continue;
+        text.toLowerCase();
+        
+        Serial.print("[TG] Command: ");
+        Serial.println(text);
+        
+        if (text == "/work") {
+          telegramCmdStart = true;
+          bot->sendMessage(chatId, "🍅 Starting...", "HTML");
+        }
+        else if (text == "/pause") {
+          telegramCmdPause = true;
+          bot->sendMessage(chatId, "⏸ Pausing...", "HTML");
+        }
+        else if (text == "/resume") {
+          telegramCmdResume = true;
+          bot->sendMessage(chatId, "▶️ Resuming...", "HTML");
+        }
+        else if (text == "/stop") {
+          telegramCmdStop = true;
+          bot->sendMessage(chatId, "⏹ Stopping...", "HTML");
+        }
+        else if (text == "/status") {
+          String msg = "🍅 ";
+          msg += (currentState == STOPPED) ? "Stopped" : 
+                 (currentState == RUNNING) ? (isWorkSession ? "Working" : "Resting") : "Paused";
+          bot->sendMessage(chatId, msg, "HTML");
+        }
+      }
+    }
+    
+    vTaskDelay(pdMS_TO_TICKS(100));  // Check queue frequently
+  }
+}
+
+// Process Telegram commands in main loop (thread-safe)
+void processTelegramCommands() {
+  if (telegramCmdStart) {
+    telegramCmdStart = false;
+    if (currentState == STOPPED) {
+      Serial.println("[TG CMD] Starting timer");
+      currentState = RUNNING;
+      isWorkSession = true;
+      startTime = millis();
+      timerStartTime = millis();
+      elapsedBeforePause = 0;
+      displayInitialized = false;  // Force display redraw
+    }
+  }
+  if (telegramCmdPause) {
+    telegramCmdPause = false;
+    if (currentState == RUNNING) {
+      Serial.println("[TG CMD] Pausing timer");
+      currentState = PAUSED;
+      pausedTime = millis();
+      elapsedBeforePause = millis() - startTime;
+      displayInitialized = false;  // Force display redraw
+    }
+  }
+  if (telegramCmdResume) {
+    telegramCmdResume = false;
+    if (currentState == PAUSED) {
+      Serial.println("[TG CMD] Resuming timer");
+      currentState = RUNNING;
+      startTime = millis() - elapsedBeforePause;
+      displayInitialized = false;  // Force display redraw
+    }
+  }
+  if (telegramCmdStop) {
+    telegramCmdStop = false;
+    if (currentState != STOPPED) {
+      Serial.println("[TG CMD] Stopping timer");
+      currentState = STOPPED;
+      displayInitialized = false;
+      displayStoppedState();  // Show home screen
+    }
+  }
+  if (telegramCmdMode) {
+    telegramCmdMode = false;
+    Serial.println("[TG CMD] Changing mode");
+    switch (currentMode) {
+      case MODE_1_1: currentMode = MODE_25_5; break;
+      case MODE_25_5: currentMode = MODE_50_10; break;
+      case MODE_50_10: currentMode = MODE_1_1; break;
+    }
+    displayInitialized = false;  // Force display redraw
+  }
+}
+
+// Start Telegram task on separate core
+void startTelegramTask() {
+  if (!wifiConnected || !telegramConfigured) return;
+  
+  // Create mutex for thread-safe telegram operations
+  telegramMutex = xSemaphoreCreateMutex();
+  
+  // Create message queue for outgoing messages
+  telegramMsgQueue = xQueueCreate(MSG_QUEUE_SIZE, sizeof(TelegramMsg));
+  
+  // Create task with low priority (but not lowest)
+  xTaskCreatePinnedToCore(
+    telegramTask,           // Task function
+    "TelegramTask",         // Task name
+    8192,                   // Stack size
+    NULL,                   // Parameters
+    1,                      // Priority (low but runs)
+    &telegramTaskHandle,    // Task handle
+    0                       // Core 0
+  );
+  Serial.println("Telegram task created on core 0");
 }
 
 // --- Helper: draw golden "R" splash (used as stopped screen) ---
@@ -709,6 +981,10 @@ void drawColorPreview() {
 }
 
 // --- Pomodoro control functions ---
+// Last telegram send time to prevent duplicates
+static unsigned long lastTgSendTime = 0;
+const unsigned long TG_SEND_DEBOUNCE = 3000;  // 3 seconds
+
 // Helper function to get current UI color based on work/rest session
 uint16_t getCurrentUIColor() {
   if (isWorkSession) {
@@ -725,33 +1001,52 @@ void drawCenteredText(const char *txt, int16_t cx, int16_t cy, uint16_t color, u
 void updateDisplay();       // forward
 
 void startTimer() {
+  if (currentState == RUNNING) return;
+  Serial.println("[TIMER] startTimer called");
   currentState = RUNNING;
   isWorkSession = true;
   startTime = millis();
-  timerStartTime = millis();  // Track when timer started for short tap protection
+  timerStartTime = millis();
   elapsedBeforePause = 0;
-  displayInitialized = false;  // Force full redraw on timer start
-  // Removed flash effect - no yellow screen on start
+  displayInitialized = false;
+  if (millis() - lastTgSendTime > TG_SEND_DEBOUNCE) {
+    lastTgSendTime = millis();
+    sendTelegramMessage("🍅 <b>Work started!</b>");
+  }
 }
 
 void pauseTimer() {
-  if (currentState == RUNNING) {
-    currentState = PAUSED;
-    pausedTime = millis();
-    elapsedBeforePause = millis() - startTime;
+  if (currentState != RUNNING) return;
+  Serial.println("[TIMER] pauseTimer called");
+  currentState = PAUSED;
+  pausedTime = millis();
+  elapsedBeforePause = millis() - startTime;
+  if (millis() - lastTgSendTime > TG_SEND_DEBOUNCE) {
+    lastTgSendTime = millis();
+    sendTelegramMessage("⏸ <b>Timer paused</b>");
   }
 }
 
 void resumeTimer() {
-  if (currentState == PAUSED) {
-    currentState = RUNNING;
-    startTime = millis() - elapsedBeforePause;
+  if (currentState != PAUSED) return;
+  Serial.println("[TIMER] resumeTimer called");
+  currentState = RUNNING;
+  startTime = millis() - elapsedBeforePause;
+  if (millis() - lastTgSendTime > TG_SEND_DEBOUNCE) {
+    lastTgSendTime = millis();
+    sendTelegramMessage("▶️ <b>Timer resumed</b>");
   }
 }
 
 void stopTimer() {
+  if (currentState == STOPPED) return;
+  Serial.println("[TIMER] stopTimer called");
   currentState = STOPPED;
-  displayInitialized = false;  // Force full redraw on next display
+  displayInitialized = false;
+  if (millis() - lastTgSendTime > TG_SEND_DEBOUNCE) {
+    lastTgSendTime = millis();
+    sendTelegramMessage("⏹ <b>Timer stopped</b>");
+  }
   displayStoppedState();
 }
 
@@ -783,10 +1078,14 @@ void updateTimer() {
         isWorkSession = false;
         startTime = millis();
         displayInitialized = false;  // Force redraw to update colors
+        // Send Telegram notification
+        sendTelegramMessage("☕ <b>Rest time!</b> Take a break.");
       } else {
         isWorkSession = true;
         startTime = millis();
         displayInitialized = false;  // Force redraw to update colors
+        // Send Telegram notification
+        sendTelegramMessage("🍅 <b>Work time!</b> Focus on your task.");
       }
     }
   }
@@ -984,65 +1283,65 @@ void handleTouchInput() {
           }
         }
         
-        // Check cancel button
+        // Check cancel button - with extra touch padding
         if (gridCancelBtnValid) {
-          if (tx >= gridCancelBtnLeft && tx <= gridCancelBtnRight &&
-              ty >= gridCancelBtnTop  && ty <= gridCancelBtnBottom) {
+          if (tx >= gridCancelBtnLeft - TOUCH_PADDING && tx <= gridCancelBtnRight + TOUCH_PADDING &&
+              ty >= gridCancelBtnTop - TOUCH_PADDING && ty <= gridCancelBtnBottom + TOUCH_PADDING) {
             inGridCancelButton = true;
           }
         }
-        // Check confirm button
+        // Check confirm button - with extra touch padding
         if (gridConfirmBtnValid) {
-          if (tx >= gridConfirmBtnLeft && tx <= gridConfirmBtnRight &&
-              ty >= gridConfirmBtnTop  && ty <= gridConfirmBtnBottom) {
+          if (tx >= gridConfirmBtnLeft - TOUCH_PADDING && tx <= gridConfirmBtnRight + TOUCH_PADDING &&
+              ty >= gridConfirmBtnTop - TOUCH_PADDING && ty <= gridConfirmBtnBottom + TOUCH_PADDING) {
             inGridConfirmButton = true;
           }
         }
       }
 
-      // Check for home screen gear button (settings) when stopped
+      // Check for home screen gear button (settings) when stopped - with extra touch padding
       bool inGearButton = false;
       if (currentState == STOPPED && currentViewMode == 0 && lastTouchValid && tx >= 0 && ty >= 0) {
         if (gearBtnValid) {
-          if (tx >= gearBtnLeft && tx <= gearBtnRight &&
-              ty >= gearBtnTop  && ty <= gearBtnBottom) {
+          if (tx >= gearBtnLeft - TOUCH_PADDING && tx <= gearBtnRight + TOUCH_PADDING &&
+              ty >= gearBtnTop - TOUCH_PADDING && ty <= gearBtnBottom + TOUCH_PADDING) {
             inGearButton = true;
           }
         }
       }
       
-      // Check for color preview buttons
+      // Check for color preview buttons - with extra touch padding
       bool inPreviewCancelButton = false;
       bool inPreviewConfirmButton = false;
       if (currentViewMode == 2 && lastTouchValid && tx >= 0 && ty >= 0) {
         if (previewCancelBtnValid) {
-          if (tx >= previewCancelBtnLeft && tx <= previewCancelBtnRight &&
-              ty >= previewCancelBtnTop  && ty <= previewCancelBtnBottom) {
+          if (tx >= previewCancelBtnLeft - TOUCH_PADDING && tx <= previewCancelBtnRight + TOUCH_PADDING &&
+              ty >= previewCancelBtnTop - TOUCH_PADDING && ty <= previewCancelBtnBottom + TOUCH_PADDING) {
             inPreviewCancelButton = true;
           }
         }
         if (previewConfirmBtnValid) {
-          if (tx >= previewConfirmBtnLeft && tx <= previewConfirmBtnRight &&
-              ty >= previewConfirmBtnTop  && ty <= previewConfirmBtnBottom) {
+          if (tx >= previewConfirmBtnLeft - TOUCH_PADDING && tx <= previewConfirmBtnRight + TOUCH_PADDING &&
+              ty >= previewConfirmBtnTop - TOUCH_PADDING && ty <= previewConfirmBtnBottom + TOUCH_PADDING) {
             inPreviewConfirmButton = true;
           }
         }
       }
 
-      // Check for mode button click first
+      // Check for mode button click first (with extra touch padding)
       bool inModeButton = false;
       if (modeBtnValid && lastTouchValid && tx >= 0 && ty >= 0) {
-        if (tx >= modeBtnLeft && tx <= modeBtnRight &&
-            ty >= modeBtnTop  && ty <= modeBtnBottom) {
+        if (tx >= modeBtnLeft - TOUCH_PADDING && tx <= modeBtnRight + TOUCH_PADDING &&
+            ty >= modeBtnTop - TOUCH_PADDING && ty <= modeBtnBottom + TOUCH_PADDING) {
           inModeButton = true;
         }
       }
       
-      // Check for status button click
+      // Check for status button click (with extra touch padding)
       bool inStatusButton = false;
       if (statusBtnValid && lastTouchValid && tx >= 0 && ty >= 0) {
-        if (tx >= statusBtnLeft && tx <= statusBtnRight &&
-            ty >= statusBtnTop  && ty <= statusBtnBottom) {
+        if (tx >= statusBtnLeft - TOUCH_PADDING && tx <= statusBtnRight + TOUCH_PADDING &&
+            ty >= statusBtnTop - TOUCH_PADDING && ty <= statusBtnBottom + TOUCH_PADDING) {
           inStatusButton = true;
         }
       }
@@ -1172,7 +1471,7 @@ void handleTouchInput() {
   } else if (touchPressed) {
     unsigned long elapsed = millis() - touchStartTime;
     
-    // Check for long press (works every time, not just first)
+    // Check for long press (only once per touch)
     if (elapsed > LONG_PRESS_MS && !longPressDetected) {
       longPressDetected = true;
       Serial.print("*** LONG PRESS detected! (");
@@ -1186,20 +1485,7 @@ void handleTouchInput() {
         Serial.println("-> Stopping timer");
         stopTimer();
       }
-      // Reset start time to allow detecting next long press while still holding
-      touchStartTime = millis();
-      longPressDetected = false;  // Reset to allow next long press detection
-    } else if (!longPressDetected) {
-      // Debug: show progress towards long press
-      static unsigned long lastProgress = 0;
-      if (millis() - lastProgress > 200) {
-        Serial.print("Holding... ");
-        Serial.print(elapsed);
-        Serial.print(" / ");
-        Serial.print(LONG_PRESS_MS);
-        Serial.println(" ms");
-        lastProgress = millis();
-      }
+      // Don't reset - only one long press per touch
     }
   }
   static unsigned long lastDebug = 0;
@@ -1768,63 +2054,32 @@ void setup(void) {
 
   // Load saved color from NVS
   loadSelectedColor();
+  
+  // Connect to WiFi
+  connectWiFi();
+  
+  // Initialize Telegram bot
+  initTelegramBot();
+  
+  // Start Telegram task on separate core
+  startTelegramTask();
 
   displayStoppedState();
 }
 
 void loop() {
+  // Handle touch FIRST - highest priority for responsiveness
   handleTouchInput();
+  
+  // Process commands from Telegram (non-blocking - just checks flags)
+  processTelegramCommands();
+  
   updateTimer();
   updateDisplay();
   checkAutoRotation();  // Check IMU for auto-rotation
 
-  // Tap indicator (green circle) - draw on top, fade out, then stop drawing
-  // The next updateDisplay() will naturally restore the UI underneath
-  if (tapIndicatorActive) {
-    unsigned long dt = millis() - tapIndicatorStart;
-    if (dt >= TAP_INDICATOR_DURATION) {
-      // Expired - just stop drawing it, updateDisplay() will restore the UI naturally
-      tapIndicatorActive = false;
-    } else {
-      // Draw green circle on top, fading out as time approaches TAP_INDICATOR_DURATION
-      int16_t cx = tapIndicatorX;
-      int16_t cy = tapIndicatorY;
-      int16_t r = TAP_RADIUS;
-      
-      // Calculate fade-out alpha: 255 (full) at start, 0 (transparent) at end
-      uint8_t alpha = 255 - (uint8_t)((dt * 255) / TAP_INDICATOR_DURATION);
-      
-      // Draw circle with fade-out (blend green with black)
-      for (int16_t y = -r; y <= r; y++) {
-        for (int16_t x = -r; x <= r; x++) {
-          if (x * x + y * y <= r * r) {
-            int16_t px = cx + x;
-            int16_t py = cy + y;
-            if (px < 0 || py < 0 || px >= gfx->width() || py >= gfx->height()) continue;
-            
-            // Blend green with black based on alpha for fade-out effect
-            uint16_t fg = COLOR_GREEN;
-            uint8_t fg_r = (fg >> 11) & 0x1F;
-            uint8_t fg_g = (fg >> 5) & 0x3F;
-            uint8_t fg_b = fg & 0x1F;
-            
-            // Black (will be replaced by UI on next updateDisplay)
-            uint8_t bg_r = 0;
-            uint8_t bg_g = 0;
-            uint8_t bg_b = 0;
-            
-            // Alpha blend: out = fg * alpha + bg * (1 - alpha)
-            uint8_t out_r = (uint8_t)((fg_r * alpha + bg_r * (255 - alpha)) / 255);
-            uint8_t out_g = (uint8_t)((fg_g * alpha + bg_g * (255 - alpha)) / 255);
-            uint8_t out_b = (uint8_t)((fg_b * alpha + bg_b * (255 - alpha)) / 255);
-            
-            uint16_t out = (out_r << 11) | (out_g << 5) | out_b;
-            gfx->drawPixel(px, py, out);
-          }
-        }
-      }
-    }
-  }
+  // Tap indicator disabled for better touch responsiveness
+  // (was causing lag due to drawing overhead)
 
-  delay(5);
+  delay(2);  // Reduced delay for faster loop
 }
