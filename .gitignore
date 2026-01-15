@@ -52,5 +52,4 @@ ENV/
 config.h
 
 # Dependencies
-lib/
 libraries/
