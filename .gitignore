@@ -53,3 +53,4 @@ config.h
 
 # Dependencies
 libraries/
+secrets.ini
